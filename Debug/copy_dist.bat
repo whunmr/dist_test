@@ -1,0 +1,1 @@
+xcopy E:\lab\distrun\distrun\Debug C:\distrun /E /I /Y
