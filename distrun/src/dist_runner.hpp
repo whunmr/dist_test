@@ -14,17 +14,22 @@
 #define k_dist_ack "dist_ack"
 #define k_dist_run "dist_run"
 #define k_dist_run_finished "dist_run_finished"
-#define k_dist_clean "dist_clean"
 
 ////////////////////////////////////////////////////////////////////////////////
 struct Job {
-  Job() : is_start(false) {/**/}
+  Job() { reset(); }
+  
   string name;
   bool is_start;
   string distor_ip;
   string distor_id;
   set<string> runner_ips;
+  size_t finished_runner_count;
 
+  bool is_done() const {
+    return finished_runner_count == runner_ips.size();
+  }
+  
   void dump_runers() {
     cout << "current runners:" << endl;
     for (set<string>::iterator i = runner_ips.begin(); i != runner_ips.end(); ++i)
@@ -37,11 +42,16 @@ struct Job {
     distor_ip = "";
     distor_id = "";
     runner_ips.clear();
+    finished_runner_count = 0;
   }
 } g_job;
 
 struct Node {
-  string id() { static string id_ = uuid(); return id_; }
+  string id() {
+    static string id_ = uuid();
+    return id_;
+  }
+  
   set<string> ips_;
 
   int runner_index_in(const set<string>& runners) {
@@ -126,7 +136,7 @@ struct Dmsg : Msg {
 ////////////////////////////////////////////////////////////////////////////////
 void* dist_job_thread_func(void*) {
   Dmsg(k_dist_req, g_job.name).broadcast();
-  sleep(3);
+  sleep(2);
   if (g_job.runner_ips.empty()) {
       printf("find no runners for job:%s.\n", g_job.name.c_str());
       reset_node_status();
@@ -136,40 +146,83 @@ void* dist_job_thread_func(void*) {
   g_job.dump_runers();
   Dmsg(k_dist_run, g_job.name).broadcast();
 
-  sleep(30); 
+  int i = 0;
+  while (1) {
+    if (g_job.is_done()) {
+      printf("job:%s is done.\n", g_job.name.c_str());
+      break;
+    } else if ( 0 == ++i % 6 ) {
+      printf("waiting runner to done for job:%s.\n", g_job.name.c_str());
+    }
+    sleep(10);
+  }
   
   reset_node_status();
   return NULL;
 }
 
-int handle_job_status_query(struct mg_connection *conn, const string& uri) {
-  const string k_status = "/__status/";
-  bool is_status_query = starts_with(uri, k_status) && uri.size() > k_status.size();
-  if ( ! is_status_query) {
+int handle_job_log_query_as_distor(struct mg_connection *conn, const string& uri, const char* job) {
+  if ( uri != "/__job_log_as_distor" || strlen(job) == 0)
     return MG_FALSE;
-  }
 
-  const string job = uri.substr(k_status.size());
-  if (job != g_job.name) {
-    string info = string("no job information, currently running job:")+g_job.name + "<p/>";
-    mg_printf_data(conn, info.c_str());
-  } else {
-    string info = string("<html><body> running job:")+g_job.name;
-    for (set<string>::iterator i = g_job.runner_ips.begin(); i != g_job.runner_ips.end(); ++i) {
-      info += "<p>" + *i  + "</p>";
-      cout << *i << endl;      
-    }
-    
-    info += "</body></html>";
-    mg_printf_data(conn, info.c_str());
+  string html = "<html><body>";
+  for (set<string>::iterator it = g_job.runner_ips.begin(); it != g_job.runner_ips.end(); ++it) {
+    html += string_format(
+      "<p>log on runner :%s</p>"
+      "<p><iframe width='1000px' height='380px' src='http://%s:9000/__job_log_as_runner?job=%s'></iframe></p>"
+      , it->c_str(), it->c_str(), job);
   }
-  return MG_TRUE;
+  html += "</body></html>";
+  
+  mg_printf_data(conn, html.c_str());
+  return MG_MORE; 
 }
 
-int handle_distrun_req(struct mg_connection *conn, const string& uri) {
-  const string k_distrun = "/distrun/";
-  bool is_dist_job_req = starts_with(uri, k_distrun) && uri.size() > k_distrun.size();
-  if ( ! is_dist_job_req) {
+int handle_job_log_query_as_runner(struct mg_connection *conn, const string& uri, const char* job) {
+  if ( uri != "/__job_log_as_runner" || strlen(job) == 0)
+    return MG_FALSE;
+
+  const char* node_id = this_node.id().c_str();
+  string html = string_format(
+    "<html><head>                                                                  "
+    "    <title>dist_test</title>                                                  "
+    "    <script src='jquery-1.11.0.min.js'></script>                              "
+    "    <script language='javascript' type='text/javascript'>                     "
+    "        var start = 0;                                                        "
+    "        function __func_to_load_from(url__, start__) {                        "
+    "            var __func = function() {                                         "
+    "                $.ajax({                                                      "
+    "                    url: url__,                                               "
+    "                    headers: {Range: 'bytes=' + start__ + '-'},               "
+    "                    success: function( rsp ) {                                "
+    "                        start += rsp.length;                                  "
+    "                        $('#dist_log').html($('#dist_log').html() + rsp);     "
+    "                        var delay = rsp.length == 0 ? 5000 : 1000;            "
+    "                        setTimeout(__func_to_load_from(url__, start), delay); "
+    "                    }                                                         "
+    "                }).fail(function() { setTimeout(__func, 5000); });            "
+    "            };                                                                "
+    "            return __func;                                                    "
+    "        };                                                                    "
+    "                                                                              "
+    "        __func_to_load_from('%s/__dist/run.log', 0)();                        "
+    "    </script>                                                                 "
+    "</head>                                                                       "
+    "<body>                                                                        "
+    "<span                                                                         "
+    "  style=\"white-space:pre; font-family: 'Lucida Console', Monaco, monospace;\""
+    "  id='dist_log'></span>                                                       "
+    "</body></html>                                                                "
+    , job);
+  
+  mg_printf_data(conn, html.c_str());
+  return MG_MORE;
+}
+
+
+
+int handle_distrun_req(struct mg_connection *conn, const string& uri, const char* job) {
+  if ( uri != "/__distrun" || strlen(job) == 0) {
       return MG_FALSE;
   }
 
@@ -179,13 +232,12 @@ int handle_distrun_req(struct mg_connection *conn, const string& uri) {
     return MG_TRUE;
   }
 
-  g_job.name = uri.substr(k_distrun.size());
+  g_job.name = job;
   g_job.distor_id = this_node.id();
-    /*"<script>setTimeout(function() { window.location.href = 'http://localhost:9000/__status/%s'; }, 5000);</script>"*/
-  const char* job = g_job.name.c_str();
+
   string html = string_format("<html><body>"
     "<p> wait job to start ...</p>"
-    "<script>setTimeout(function() { window.location.href = 'http://192.168.33.3:9000/job_123456/__dist/run.log'; setTimeout(function() { window.location.href = 'http://192.168.33.3:9000/job_123456/__dist/run.log'; }, 5000)}, 5000);</script>"
+    "<script>setTimeout(function() { window.location.href = 'http://localhost:9000/__job_log_as_distor?job=%s'; }, 5000);</script>"
     "</body></html>", job);
   mg_printf_data(conn, html.c_str());
   
@@ -193,22 +245,14 @@ int handle_distrun_req(struct mg_connection *conn, const string& uri) {
   return MG_MORE;
 }
 
-int handle_api_sum_req(struct mg_connection *conn, const string& uri) {
-  if ( ! starts_with(uri, "/api/sum"))
-    return MG_FALSE;
-  
-  char n1[100], n2[100];
-  mg_get_var(conn, "n1", n1, sizeof(n1));
-  mg_get_var(conn, "n2", n2, sizeof(n2));
-  mg_printf_data(conn, "{ \"result\": %lf }", strtod(n1, NULL) + strtod(n2, NULL));
-  return MG_TRUE;
-}
-
 int handle_list_dir_req(struct mg_connection *conn, const string& uri) {
   if ( ! ends_with(uri, "/"))
     return MG_FALSE;
   
   string dir = uri.substr(1, uri.size() - 1);
+  if (dir.empty()) {
+    dir = ".";
+  }
   printf("will sending directory list for: %s\n", dir.c_str());
   send_directory_listing(MG_CONN_2_CONN(conn), dir.c_str());
   return MG_TRUE;
@@ -221,9 +265,13 @@ static int http_req_handler(struct mg_connection *conn, enum mg_event ev) {
   if (MG_REQUEST == ev) {
     string uri(conn->uri);
     int ret;
-    if (  MG_FALSE != (ret = handle_distrun_req(conn, uri))
-       || MG_FALSE != (ret = handle_api_sum_req(conn, uri))
-       || MG_FALSE != (ret = handle_job_status_query(conn, uri))
+    
+    char param_job[1024];
+    mg_get_var(conn, "job", param_job, sizeof(param_job));
+
+    if (  MG_FALSE != (ret = handle_distrun_req(conn, uri, &param_job[0]))
+       || MG_FALSE != (ret = handle_job_log_query_as_distor(conn, uri, &param_job[0]))
+       || MG_FALSE != (ret = handle_job_log_query_as_runner(conn, uri, &param_job[0]))
        || MG_FALSE != (ret = handle_list_dir_req(conn, uri)))
       return ret;
 
@@ -250,6 +298,8 @@ void* fetch_tests_and_run(void*) {
   printf("* start fetch job:%s, cmd:%s.\n", g_job.name.c_str(), cmd.c_str());
   system(cmd.c_str());
   printf("run cmd done: %s\n", cmd.c_str());
+
+  Dmsg(k_dist_run_finished, g_job.name).broadcast();
   
   reset_node_status();
   return NULL;
@@ -292,6 +342,12 @@ static void udp_handler(struct ns_connection *nc, int ev, void *) {
         if (msg.is(k_dist_ack) && !g_job.is_start) {
           printf("confirm will run job on: %s\n", peer_ip(nc).c_str());
           g_job.runner_ips.insert(peer_ip(nc));
+          return;
+        }
+
+        if (msg.is(k_dist_run_finished) && this_node.is_distor()) {
+          ++g_job.finished_runner_count;
+          printf("job:%s finished on: %s, finished count:%d\n", msg["job"], peer_ip(nc).c_str(), g_job.finished_runner_count);
           return;
         }
       }
